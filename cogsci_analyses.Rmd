@@ -1,0 +1,316 @@
+---
+title: "cogsci_analyses"
+output: html_document
+---
+
+```{r setup}
+
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(stats)
+library(stringr)
+library(lmtest)
+library(gridExtra)
+
+# Offset the sigmoid with a lower asymptote.
+offset_logit <- function(x, upper, lower, xmid, scale, increasing=TRUE) {
+  if(increasing) {
+    return(lower + SSlogis(x, upper-lower, xmid, scale))
+  } else {
+    return(upper - SSlogis(x, upper-lower, xmid, scale))
+  }
+}
+# Run a sigmoid regression.
+sigmoid_regression <- function(x, y, return_residuals=TRUE, increasing=TRUE, use_default=FALSE) {
+  df <- data.frame(x,y)
+  df <- setNames(df, c("X", "Y"))
+  reg <- NULL
+  if(use_default) {
+    # Use default sigmoid and parameters.
+    reg <- nls(Y~SSlogis(X, upper, xmid, scale),
+               data=df, control=nls.control(maxiter = 50000, minFactor=1e-12))
+  } else {
+    # Use custom initializations and parameters.
+    # Includes an additional lower asymptote term, and allows increasing or decreasing sigmoids.
+    # Runs with multiple initializations.
+    x_range <- max(df$X) - min(df$X)
+    start_mid <- min(df$X) + x_range*0.2 # Range from 0.2 to 0.8 of the total range.
+    attempt <- 0
+    env=new.env() # This environment is used to store whether completed, to be accessed within the error functions.
+    assign("completed_regression", FALSE, env=env)
+    while(!get("completed_regression", env=env) & attempt < 20) {
+      attempt <- attempt + 1
+      start_mid <- start_mid + x_range*0.03
+      tryCatch(
+        expr = {
+          start <- list(upper=max(df$Y), lower=min(df$Y), xmid=start_mid, scale=x_range/50.0)
+          reg <- nls(Y~offset(offset_logit(X, upper, lower, xmid, scale, increasing=increasing)),
+                     start = start,
+                     data=df, control=nls.control(maxiter = 50000, minFactor=1e-12))
+          assign("completed_regression", TRUE, env=env)
+        }, error = function(e) {
+          if(grepl("iterations", e$message)) {
+            print("Warning: reached maximum iterations!")
+            assign("completed_regression", TRUE, env=env)
+          }
+        }
+      )
+    }
+    if(attempt >= 20 & !get("completed_regression", env=env)) {
+      print("Error: maximum attempts reached.")
+    }
+    # Rerun to obtain the regression with the last initial values.
+    reg <- nls(Y~offset(offset_logit(X, upper, lower, xmid, scale, increasing=increasing)),
+               start = start,
+               data=df, control=nls.control(maxiter = 50000, minFactor=1e-12, warnOnly=TRUE))
+  }
+  if(return_residuals) {
+    return(residuals(reg))
+  } else {
+    coeffs <- coef(summary(reg))[,1]
+    upper <- coeffs[1]
+    lower <- coeffs[2]
+    xmid <- coeffs[3]
+    scale <- coeffs[4]
+    return(c(upper, lower, xmid, scale))
+  }
+}
+
+# Check coefficient for a linear regression.
+check_coeffs <- function(linear_reg, field="AdjustedDiversity") {
+  coeffs <- coef(summary(linear_reg))
+  if (coeffs[field,"Pr(>|t|)"] < 0.05) {
+    cat("\n    ", field, " has a significant sign (p=", coeffs[field,"Pr(>|t|)"], ") ") }
+  else {
+    cat("\n    ", field, " is not significant ")
+  }
+  if (sign(coeffs[field,"Estimate"]) == 1) {
+    cat("(+)") }
+  else {
+    cat("(-)") }
+}
+
+```
+
+```{r child_regressions}
+
+run_language <- function(wordbank_language, childes_language, window_size=15, max_tokens_suffix="") {
+  cat("\n\n", childes_language)
+  
+  # Get AoA.
+  child_data_df <- read.table(file="cogsci_data/child_aoa.tsv",
+                              encoding="UTF-8", header=TRUE, sep="\t", fill=TRUE, quote="")
+  child_data_df$language <- as.factor(child_data_df$language)
+  child_data_df <- child_data_df %>% filter(child_data_df$language == wordbank_language &
+                                            child_data_df$measure == "produces")
+  
+  # Store word info (lexical class, uni_lemma, n_chars).
+  word_info_df <- child_data_df %>% dplyr::select(CleanedSingle, lexical_class, uni_lemma)
+  word_info_df <- unique(word_info_df)
+  word_info_df <- setNames(word_info_df, c("Token", "LexicalClass", "UniLemma"))
+  word_info_df$LexicalClass <- as.factor(word_info_df$LexicalClass)
+  word_info_df$NChars <- nchar(word_info_df$Token)
+  word_info_df$UniLemmaWord <- stringr::word(word_info_df$UniLemma, 1)
+  
+  # Add concreteness data.
+  concreteness_df <- read.table(file="cogsci_data/concreteness_data.tsv",
+                                encoding="UTF-8", header=TRUE, sep="\t", fill=TRUE, quote="")
+  concreteness_df <- concreteness_df %>% dplyr::select(Word, Conc.M)
+  concreteness_df <- setNames(concreteness_df, c("Token", "Concreteness"))
+  word_info_df <- merge(word_info_df, concreteness_df, by.x="UniLemmaWord", by.y="Token", all.x=TRUE) # Merge by English lemma.
+  cat("\n  Imputing ", sum(is.na(word_info_df$Concreteness)), " concreteness values.")
+  word_info_df$Concreteness[is.na(word_info_df$Concreteness)] <- mean(word_info_df$Concreteness, na.rm=TRUE) # Replace NA.
+  word_info_df <- unique(word_info_df)
+  
+  # For AoA, average over all data for each word (i.e. rows with the same token and unigram lemma).
+  child_data_df <- child_data_df %>% dplyr::select(CleanedSingle, aoa, uni_lemma)
+  child_data_df <- unique(child_data_df) # Remove duplicates.
+  child_data_df <- aggregate(child_data_df$aoa, by=list(child_data_df$CleanedSingle, child_data_df$uni_lemma), FUN=mean)
+  child_data_df <- setNames(child_data_df, c("Token", "UniLemma", "AoA"))
+  child_data_df <- merge(child_data_df, word_info_df, by.x=c("Token", "UniLemma"), by.y=c("Token", "UniLemma"))
+  
+  # Get contextual diversities, frequencies, and MLU (lemmatized).
+  diversity_file <- "cogsci_data/diversities/"
+  if (max_tokens_suffix != "") { diversity_file <- paste(diversity_file, "corpus_sizes/", sep="") }
+  diversity_file <- paste(diversity_file, childes_language, "_diversities_window", window_size,
+                          max_tokens_suffix, ".txt", sep="")
+  diversity_df <- read.table(file=diversity_file, encoding="UTF-8", header=TRUE, sep="\t", fill=TRUE, quote="")
+  # Note: these are lemmatized frequencies.
+  diversity_df$LemmatizedLogFreq <- log(diversity_df$CountPerThousand)
+  # Replace log(0)=-inf with the minimum value.
+  cat("\n  Imputing ", sum(is.infinite(diversity_df$LemmatizedLogFreq)), " lemmatized log-frequency values.")
+  diversity_df$LemmatizedLogFreq[is.infinite(diversity_df$LemmatizedLogFreq)] <- 
+      min(diversity_df$LemmatizedLogFreq[diversity_df$LemmatizedLogFreq != -Inf], na.rm=TRUE)
+  # Impute missing MLUs.
+  diversity_df <- dplyr::rename(diversity_df, LemmatizedMLU=MLU)
+  cat("\n  Imputing ", sum(is.na(diversity_df$LemmatizedMLU)), " lemmatized MLU values.")
+  diversity_df$LemmatizedMLU[is.na(diversity_df$LemmatizedMLU)] <- mean(diversity_df$LemmatizedMLU, na.rm=TRUE) # Replace NA.
+  child_data_df <- merge(child_data_df, diversity_df, by.x="Token", by.y="Token") # Merge by the actual tokens.
+  
+  # Get un-lemmatized frequency.
+  childes_df <- read.table(file=sprintf("cogsci_data/childes_data/childes_%s.tsv", childes_language),
+                           encoding="UTF-8", header=TRUE, sep="\t", fill=TRUE, quote="")
+  childes_df$word <- tolower(childes_df$word)
+  childes_df <- childes_df %>% filter(childes_df$word != '')
+  childes_freq_df <- childes_df %>% dplyr::select(word, word_count)
+  childes_freq_df <- aggregate(childes_df$word_count, by=list(childes_df$word), FUN=sum)
+  childes_freq_df <- setNames(childes_freq_df, c("Token", "ChildesCount"))
+  total_child_tokens <- sum(childes_freq_df$ChildesCount)
+  childes_freq_df$ChildesCountPerThousand <- (childes_freq_df$ChildesCount*1000.0)/total_child_tokens
+  # All tokens have count at least 1, so log is not -Inf.
+  childes_freq_df$UnlemmatizedLogFreq <- log(childes_freq_df$ChildesCountPerThousand)
+  # Keep all tokens even if they never appeared in CHILDES (very low frequency).
+  child_data_df <- merge(child_data_df, childes_freq_df, by.x="Token", by.y="Token", all.x=TRUE) # Merge by the actual tokens.
+  cat("\n  Imputing ", sum(is.na(child_data_df$UnlemmatizedLogFreq)), " un-lemmatized log-frequency values.")
+  child_data_df$UnlemmatizedLogFreq[is.na(child_data_df$UnlemmatizedLogFreq)] <-
+      min(child_data_df$UnlemmatizedLogFreq, na.rm=TRUE)
+  
+  # Get un-lemmatized MLU.
+  childes_mlu_df <- childes_df %>% dplyr::select(word, mean_sent_length)
+  childes_mlu_df <- aggregate(childes_df$mean_sent_length, by=list(childes_df$word), FUN=mean)
+  childes_mlu_df <- setNames(childes_mlu_df, c("Token", "UnlemmatizedMLU"))
+  # Keep all tokens even if they never appeared in CHILDES.
+  child_data_df <- merge(child_data_df, childes_mlu_df, by.x="Token", by.y="Token", all.x=TRUE) # Merge by the actual tokens.
+  cat("\n  Imputing ", sum(is.na(child_data_df$UnlemmatizedMLU)), " un-lemmatized MLU values.")
+  child_data_df$UnlemmatizedMLU[is.na(child_data_df$UnlemmatizedMLU)] <- mean(child_data_df$UnlemmatizedMLU, na.rm=TRUE)
+  child_data_df <- child_data_df %>% dplyr::select(Token, UniLemma, AoA, LexicalClass, NChars, Concreteness,
+                                                   Diversity, DiversityEntropy, LemmatizedMLU, LemmatizedLogFreq,
+                                                   UnlemmatizedLogFreq, UnlemmatizedMLU)
+  
+  # Use the lemmatized log-frequencies and MLU.
+  child_data_df$LogFreq <- child_data_df$LemmatizedLogFreq
+  child_data_df$MLU <- child_data_df$LemmatizedMLU
+  
+  # Run sigmoid regression to get adjusted contextual diversity.
+  # If it does not converge, use a quadratic model.
+  diversity_plot <- NULL
+  try(expr = {
+    child_data_df$AdjustedDiversity <- sigmoid_regression(child_data_df$LogFreq,
+                                                          child_data_df$Diversity,
+                                                          use_default=TRUE, return_residuals=TRUE)
+    # Plot the contextual diversity.
+    coeffs <- sigmoid_regression(child_data_df$LogFreq, child_data_df$Diversity,
+                                 use_default=TRUE, return_residuals=FALSE)
+    diversity_plot <- ggplot(child_data_df, aes(x=LogFreq, y=Diversity)) +
+                             theme_bw() + xlab("Log-frequency") + ylab("Diversity") +
+                             geom_point(size=1, alpha=0.1) +
+                             geom_function(fun = function(x) SSlogis(x, coeffs[1], coeffs[2], coeffs[3]), color="blue")
+  }, silent=TRUE)
+  if (is.null(diversity_plot)) {
+    cat("\n  ERROR in sigmoid regression Diversity ~ LogFreq; using quadratic regression.")
+    linear_reg <- lm(Diversity ~ poly(LogFreq, 2), data=child_data_df)
+    child_data_df$AdjustedDiversity <- residuals(linear_reg)
+    diversity_plot <- ggplot(child_data_df, aes(x=LogFreq, y=Diversity)) +
+                             theme_bw() + xlab("Log-frequency") + ylab("Diversity") +
+                             geom_point(size=1, alpha=0.1) +
+                             geom_smooth(method="lm", formula=y~poly(x, 2), se=FALSE, color="blue")
+  }
+  ggsave(file=paste("figures/diversity_sigmoid_", childes_language, ".pdf", sep=""), plot=diversity_plot, width=2, height=2)
+  
+  # -----------------
+  # Run regressions.
+  # -----------------
+  cat("\n  Num tokens: ", length(levels(as.factor(child_data_df$Token))))
+
+  # Remove unreasonable AoAs (less than zero or older than five years).
+  outliers_df <- child_data_df %>% filter(child_data_df$AoA <= 0.0 | child_data_df$AoA >= 60.0)
+  child_data_df <- child_data_df %>% filter(child_data_df$AoA > 0.0 & child_data_df$AoA < 60.0)
+  cat("\n  Num tokens after outlier AoAs removed: ", length(levels(as.factor(child_data_df$Token))))
+  cat("\n  Removed: ", outliers_df$Token)
+  
+  # Remove diversity outliers.
+  std <- sd(child_data_df$AdjustedDiversity)
+  m <- mean(child_data_df$AdjustedDiversity)
+  outliers_df <- child_data_df %>% filter(child_data_df$AdjustedDiversity <= m-3*std | child_data_df$AdjustedDiversity >= m+3*std)
+  child_data_df <- child_data_df %>% filter(child_data_df$AdjustedDiversity > m-3*std & child_data_df$AdjustedDiversity < m+3*std)
+  cat("\n  Num tokens after outlier diversities removed: ", length(levels(as.factor(child_data_df$Token))))
+  cat("\n  Removed: ", outliers_df$Token)
+  
+  # Optionally remove the lexical class "other".
+  # child_data_df <- child_data_df %>% filter(child_data_df$LexicalClass != "other")
+  
+  # VIF between frequency and contextual diversity.
+  library(car)
+  linear_reg <- lm(AoA ~ LogFreq + Diversity,
+                 data=child_data_df)
+  cat("\n  LogFreq and Diversity VIF: ")
+  cat(vif(linear_reg))
+  
+  # Regression for adjusted diversity alone:
+  linear_reg <- lm(AoA ~ AdjustedDiversity, data=child_data_df)
+  cat("\n  Adjusted diversity alone R^2: ", summary(linear_reg)$adj.r.squared)
+  check_coeffs(linear_reg, field="AdjustedDiversity")
+  
+  # Overall regression.
+  without_diversity <- glm(AoA ~ LogFreq + LexicalClass + NChars + Concreteness + MLU,
+                           data=child_data_df)
+  with_diversity <- glm(AoA ~ AdjustedDiversity + LogFreq + LexicalClass + NChars + Concreteness + MLU,
+                        data=child_data_df)
+  lrt <- lrtest(without_diversity, with_diversity)
+  with_diversity <- lm(AoA ~ AdjustedDiversity + LogFreq + LexicalClass + NChars + Concreteness + MLU,
+                       data=child_data_df)
+  cat("\n  Including covariates R^2: ", summary(with_diversity)$adj.r.squared)
+  cat("\n    LRT p =", lrt$'Pr(>Chisq)'[-1])
+  check_coeffs(with_diversity, field="AdjustedDiversity")
+  cat("\n  Contextual diversity VIF in overall regression: ")
+  cat(vif(with_diversity)["AdjustedDiversity", "GVIF"])
+  
+  # Correlation: raw diversity and log-frequency:
+  filtered_df <- child_data_df %>% dplyr::select(Diversity, LogFreq)
+  cat("\n  Correlation raw diversity, log-frequency: ")
+  cat(cor(filtered_df, method="pearson"))
+  # Correlation AdjustedDiversity, MLU:
+  # filtered_df <- child_data_df %>% dplyr::select(AdjustedDiversity, MLU)
+  # cat("\n  Correlation AdjustedDiversity, MLU: ")
+  # cat(cor(filtered_df, method="pearson"))
+  
+  # Effects of log-frequency alone:
+  # linear_reg <- lm(AoA ~ LogFreq, data=child_data_df)
+  # cat("\n  LogFreq alone R^2: ", summary(linear_reg)$adj.r.squared)
+  
+  # Effects of raw diversity alone:
+  # linear_reg <- lm(AoA ~ Diversity, data=child_data_df)
+  # cat("\n  Raw diversity alone R^2: ", summary(linear_reg)$adj.r.squared)
+  # check_coeffs(linear_reg, field="Diversity")
+  
+  # By lexical class:
+  # for (lex_class in levels(as.factor(child_data_df$LexicalClass))) {
+  #   cat("\n", lex_class)
+  #   filtered_df <- child_data_df %>%
+  #     filter(child_data_df$LexicalClass==lex_class)
+  #   linear_reg <- lm(AoA ~ AdjustedDiversity, data=filtered_df)
+  #   cat("\n    Adjusted diversity R^2: ", summary(linear_reg)$adj.r.squared)
+  #   check_coeffs(linear_reg, field="AdjustedDiversity")
+  # }
+  
+  # Print proportion of tokens in each class.
+  # cat("\n  Lexical class proportions: (", levels(child_data_df$LexicalClass), ")\n  ")
+  # cat(table(child_data_df$LexicalClass)/sum(table(child_data_df$LexicalClass)), "\n")
+  
+  # Save the adjusted diversities.
+  adjusted_diversities_output <- paste("cogsci_data/adjusted_diversities/", childes_language, "_adjusted_diversities_window5.tsv", sep="")
+  filtered_df <- child_data_df %>% dplyr::select(Token, UniLemma, AoA, AdjustedDiversity, Diversity,
+                                                 LogFreq, LexicalClass, NChars, Concreteness, MLU)
+  write.table(filtered_df, file=adjusted_diversities_output, quote=FALSE, sep='\t', row.names=FALSE)
+  
+  return(child_data_df)
+}
+
+```
+
+```{r run_child_regressions}
+
+window_size <- 5
+max_tokens_suffix <- "_250Ktokens" # Overwrite this by default.
+max_tokens_suffix <- ""
+
+child_data_df <- run_language("English (American)", "eng-na", window_size=window_size, max_tokens_suffix=max_tokens_suffix)
+child_data_df <- run_language("German", "german", window_size=window_size, max_tokens_suffix=max_tokens_suffix)
+child_data_df <- run_language("Mandarin (Beijing)", "mandarin", window_size=window_size, max_tokens_suffix=max_tokens_suffix)
+child_data_df <- run_language("Spanish (Mexican)", "spanish", window_size=window_size, max_tokens_suffix=max_tokens_suffix)
+child_data_df <- run_language("French (French)", "french", window_size=window_size, max_tokens_suffix=max_tokens_suffix)
+
+```
