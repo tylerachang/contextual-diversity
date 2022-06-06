@@ -2,11 +2,10 @@
 Code and data for the paper [Does Contextual Diversity Hinder Early Word Acquisition?](https://tylerachang.github.io/paper_pdfs/cogsci_2022_contextual_diversity_word_acquisition.pdf) (CogSci 2022).
 Includes code for computing contextual diversities for words in a corpus.
 Run on Python 3.9.13 and R 4.2.0.
-Data is in cogsci_data/adjusted_diversities.
+Processed data is in cogsci_data/adjusted_diversities.
 
 ## Child age of acquisition (AoA) data.
 Child age of acquisition data is pulled from Wordbank (Frank et al., 2017).
-Child-directed speech data is pulled from CHILDES (MacWhinney, 2000).
 1. Get age of acquisition data (r_code/get_child_aoa.R). This pulls multilingual AoA data.
 2. Clean the AoA token data from the previous step (clean_wordbank_words.py).
 This is beause the UTF-8 bytes can sometimes get offset.
@@ -14,11 +13,12 @@ This adds a CleanedWord and CleanedSingle column to the dataset, where CleanedSi
 The output should be saved as the child AoA file (e.g. child_aoa.tsv).
 
 ## Raw contextual diversities.
+Child-directed speech data is pulled from CHILDES (MacWhinney, 2000).
 1. Get the CHILDES data (get_childes_data.py).
 This outputs a txt and tsv file for each language.
 The txt file contains the raw sentences, and the tsv file contains statistics (word counts and mean sentence lengths) for each wordform.
 2. Compute the raw contextual diversities for each language (get_contextual_diversities.py).
-Frequency-adjusted contextual diversities are computed later in R (see below).
+Frequency-adjusted contextual diversities are computed later in R (cogsci_analyses.Rmd).
 Sample usage for English:
 <pre>
 python3 get_contextual_diversities.py \
@@ -36,6 +36,7 @@ python3 get_contextual_diversities.py \
 All analyses can be reproduced using cogsci_analyses.Rmd.
 This includes computing the frequency-adjusted contextual diversities and running the statistical tests.
 Concreteness norms from Brysbaert et al. (2014).
+Processed data is in cogsci_data/adjusted_diversities.
 
 ## Citation.
 <pre>
